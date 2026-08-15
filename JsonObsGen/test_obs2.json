@@ -260,6 +260,37 @@
             "value": -1
           }
         ]
+      },
+      {
+        "system": "BDS",
+        "svid": 21,
+        "powerValue": [
+          {
+            "epoch": 20,
+            "unit": "dBHz",
+            "value": 45
+          },
+          {
+            "epoch": 40,
+            "unit": "dBHz",
+            "value": 40
+          },
+          {
+            "epoch": 60,
+            "unit": "dBHz",
+            "value": 35
+          },
+          {
+            "epoch": 80,
+            "unit": "dBHz",
+            "value": 30
+          },
+          {
+            "epoch": 100,
+            "unit": "dBHz",
+            "value": -1
+          }
+        ]
       }
     ]
   }

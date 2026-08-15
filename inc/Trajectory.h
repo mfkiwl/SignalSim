@@ -101,6 +101,7 @@ public:
 	BOOL GetNextPosVelECEF(double TimeStep, KINEMATIC_INFO &PosVel);
 	BOOL GetNextPosVelLLA(double TimeStep, LLA_POSITION &Position, LOCAL_SPEED &Velocity);
 	double GetTimeLength();
+	int GetSegmentCount();
 	void SetTrajectoryName(char *Name);
 	char *GetTrajectoryName() { return TrajectoryName; }
 	CTrajectorySegment *GetTrajectorySegment(int Index);

@@ -15,6 +15,7 @@
 #include "GnssTime.h"
 #include "PilotBit.h"
 #include "NavData.h"
+#include "NavBit.h"
 #include "LNavBit.h"
 #include "CNavBit.h"
 #include "CNav2Bit.h"

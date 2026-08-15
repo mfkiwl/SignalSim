@@ -26,6 +26,14 @@ CPowerControl::~CPowerControl()
 		free(PowerControlArray);
 }
 
+void CPowerControl::Clear()
+{
+	if (PowerControlArray)
+		free(PowerControlArray);
+	PowerControlArray = NULL;
+	ArraySize = 0;
+}
+
 void CPowerControl::AddControlElement(PSIGNAL_POWER pControlElement)
 {
 	// allocate array or expand size

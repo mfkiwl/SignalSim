@@ -109,6 +109,7 @@ void SetJsonFilePath(const char *FilePath)
 
 BOOL AssignParameters(JsonObject *Object, PUTC_TIME UtcTime, PLLA_POSITION StartPos, PLOCAL_SPEED StartVel, CTrajectory *Trajectory, CNavData *NavData, POUTPUT_PARAM OutputParam, CPowerControl *PowerControl, PDELAY_CONFIG DelayConfig)
 {
+	if (!Object) return FALSE;
 	for (Object = Object->GetFirstObject(); Object; Object = Object->GetNextObject())
 	{
 		switch (SearchDictionary(Object->Key, PARAMETER(KeyDictionaryListParam)))
@@ -279,6 +280,7 @@ BOOL SetOutputParam(JsonObject *Object, OUTPUT_PARAM &OutputParam)
 	// default output GPS L1 only
 	OutputParam.FreqSelect[0] = 0x1;
 	OutputParam.FreqSelect[1] = OutputParam.FreqSelect[2] = OutputParam.FreqSelect[3] = 0;
+	OutputParam.SampleFreq = OutputParam.CenterFreq = 0;	// 0 means not set, do not care or assign default value in user application
 
 	for (; Object; Object = Object->GetNextObject())
 	{

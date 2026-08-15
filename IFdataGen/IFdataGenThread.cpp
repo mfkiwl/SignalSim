@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <thread>
+#include <queue>
 
 #include "SignalSim.h"
 
@@ -21,11 +22,11 @@
 #define TOTAL_SAT_CHANNEL 128
 
 typedef enum {
-    DataBitLNav, DataBitCNav, DataBitCNav2, // for GPS
-    DataBitGNav, DataBitGNav2,	// for GLONASS
-    DataBitD1D2, DataBitBCNav1, DataBitBCNav2, DataBitBCNav3,	// for BDS
-    DataBitINav, DataBitFNav, DataBitECNav,	// for Galileo
-    DataBitSbas, // for SBAS
+	DataBitLNav, DataBitCNav, DataBitCNav2, // for GPS
+	DataBitGNav, DataBitGNav2,	// for GLONASS
+	DataBitD1D2, DataBitBCNav1, DataBitBCNav2, DataBitBCNav3,	// for BDS
+	DataBitINav, DataBitFNav, DataBitECNav,	// for Galileo
+	DataBitSbas, // for SBAS
 } DataBitType;
 
 struct CommandArguments
@@ -76,50 +77,81 @@ const char *SignalName[][8] = {
 };
 
 // thread synchronize variables
-//const int NUM_THREADS = 3;  // Ïß³ÌÊýÁ¿
 std::mutex mtx;
-std::condition_variable cv_task;	// for start task
-std::condition_variable cv_ready;	// for task ready
-std::condition_variable cv_done;	// for task complete notification
-int exec_cycle = 0;
+std::condition_variable cv_task;	// to notify task thread start
+std::condition_variable cv_ready;	// to notify main thread ready
+//std::condition_variable cv_done;	// for task complete notification
+
+std::queue<CSatIfSignal*> task_queue;
+int total_threads = 0;
 int ready_tasks = 0;
-int completed_tasks = 0;
+int idle_threads = 0;
+int ready_generation = 0;
+int work_generation = 0;
 bool shutdown = false;
 
-// IF signal generation thread
-void IF_generate_thread(CSatIfSignal* SatIfSignal)
-{
-	int thread_cycle = -1;
+int exec_cycle = 0;
 
+// IF signal generation thread
+void IF_generate_thread(int thread_id)
+{
 	while (true)
 	{
-		std::unique_lock<std::mutex> lock(mtx);
-
-		++ready_tasks;
-		if (ready_tasks == TotalChannelNumber)
-			cv_ready.notify_one();  // notify main thread ready state
-
-		// wait task or termineate
-		cv_task.wait(lock, [&] { return (exec_cycle > thread_cycle) || shutdown; });
-
-		if (shutdown)
-			break;
-
-		thread_cycle = exec_cycle;
-		// unlock to have other threads continue
-		lock.unlock();
-
-//		std::cout << "[Sat " << SatIfSignal->Svid << "] for " << exec_cycle << " begin..." << std::endl;
-		SatIfSignal->GetIfSample(CurTime);
-//		std::cout << "[Sat " << SatIfSignal->Svid << "] for " << exec_cycle << " end" << std::endl;
-
-        // update complete count
+		int current_ready_gen;
+		// stage 1: wait for main thread to dispatch tasks (production mode)
 		{
-			std::lock_guard<std::mutex> lock(mtx);
-			++completed_tasks;
-			if (completed_tasks == TotalChannelNumber)
-				cv_done.notify_one();  // notify main thread work done
+			std::unique_lock<std::mutex> lock(mtx);
+			if (shutdown) break;
+
+			current_ready_gen = ready_generation;
+			ready_tasks ++;
+
+			// all threads are ready, notify main thread to dispatch tasks
+			if (ready_tasks == total_threads)
+				cv_ready.notify_one();
+
+			// wait for main thread to release (update cycle or issue stop command)
+			cv_task.wait(lock, [&] { return ready_generation > current_ready_gen || shutdown; });
+
+			if (shutdown) break;
 		}
+
+		// stage 2: acquire tasks from the queue and execute (consumer mode)
+		while (true)
+		{
+			CSatIfSignal *task;
+			bool has_task = false;
+
+			{
+				std::unique_lock<std::mutex> lock(mtx);
+				if (!task_queue.empty())
+				{
+					task = task_queue.front();
+					task_queue.pop();
+					has_task = true;
+				}
+				else
+				{
+					// queue is empty, mark this thread as idle and wait for next round
+					idle_threads++;
+					// if all threads are idle, notify main thread to combine IF data
+					if (idle_threads == total_threads)
+						cv_ready.notify_one(); // notify main thread to combine IF data
+					
+					int current_work_gen = work_generation;
+					// wait for main thread to complete data combination and start next round
+					cv_task.wait(lock, [&] { return work_generation > current_work_gen || shutdown; });
+					
+					break; // exit the inner task acquisition loop and return to the top-level ready stage
+				}
+			}
+
+			// if we have a task, execute it outside the lock to allow other threads to acquire tasks
+			if (has_task)
+				task->GetIfSample(CurTime);
+		}
+		
+		if (shutdown) break;
 	}
 }
 
@@ -143,10 +175,11 @@ int main(int argc, char* argv[])
 	int IfFreq, FdmaOffset;
 	complex_number *NoiseArray;
 	unsigned char *QuantArray;
-	FILE* IfFile;
+	FILE* IfFile = NULL;
 	CommandArguments Arguments;
+	int ThreadNumber = std::thread::hardware_concurrency();
 
-    std::vector<std::thread> threads;
+	std::vector<std::thread> threads;
 
 	// Default arguments
 	Arguments.ConfigFile = "IfGenTest.json"; // Default JSON file
@@ -154,6 +187,9 @@ int main(int argc, char* argv[])
 	Arguments.MultiThread = true; // Default to use multi-threading
 	Arguments.ValidateOnly = false;
 	Arguments.OutputTag = false;
+
+	SetOutputFile(stdout);
+//	SetOutputLevel(MSG_LEVEL_INFO);
 
 	// Show help if no arguments provided
 	if (argc == 1)
@@ -164,25 +200,30 @@ int main(int argc, char* argv[])
 
 	if (!ParseCommandLineArgs(argc, argv, Arguments))
 		return 1;
-
+	if (Arguments.MultiThread && ThreadNumber <= 2)
+	{
+		std::cerr << "[WARNING] Not enough CPU cores for multi-threading\n";
+		Arguments.MultiThread = false;
+	}
 	
 	printf("\n================================================================================\n");
 	printf("                          IF SIGNAL GENERATION \n");
 	printf("================================================================================\n");
 
-    // Read the JSON file
+	// Read the JSON file
 	printf("[INFO]\tLoading JSON file: %s\n", Arguments.ConfigFile.c_str());
-    if (JsonTree.ReadFile(Arguments.ConfigFile.c_str()) != 0)
-    {
-        std::cerr << "[ERROR]\tUnable to read JSON file: " << Arguments.ConfigFile << "\n";
-        return 1;
-    }
+	if (JsonTree.ReadFile(Arguments.ConfigFile.c_str()) != 0)
+	{
+		std::cerr << "[ERROR]\tUnable to read JSON file: " << Arguments.ConfigFile << "\n";
+		return 1;
+	}
 	else
 	{
 		printf("[INFO]\tJSON file read successfully: %s\n", Arguments.ConfigFile.c_str());
 	}
-    Object = JsonTree.GetRootObject();
 
+	SetJsonFilePath(Arguments.ConfigFile.c_str());
+	Object = JsonTree.GetRootObject();
 	AssignParameters(Object, &UtcTime, &StartPos, &StartVel, &Trajectory, &NavData, &OutputParam, &PowerControl, NULL);
 
 	if (!Arguments.OutputFile.empty())
@@ -193,33 +234,24 @@ int main(int argc, char* argv[])
 		printf("[INFO]\tUsing output file from command line: %s\n", OutputParam.filename);
 	}
 
-	// Validate configuration and exit if requested
-	if (Arguments.ValidateOnly)
-	{
-		// TODO: Fully Implement Validation
-		printf("[INFO]\tConfiguration validation To Be Implemented.\n");
-		printf("[INFO]\tOutput file: %s\n", OutputParam.filename);
-		printf("[INFO]\tSample frequency: %.2f MHz\n", OutputParam.SampleFreq / 1e3);
-		printf("[INFO]\tCenter frequency: %.4f MHz\n", OutputParam.CenterFreq / 1e3);
-		printf("[INFO]\tFormat: %s\n", (OutputParam.Format == OutputFormatIQ2) ? "IQ2" : (OutputParam.Format == OutputFormatIQ4) ? "IQ4" : "IQ8");
-		return 0;
-	}
-
 	// initial variables
- 	Trajectory.ResetTrajectoryTime();
+	Trajectory.ResetTrajectoryTime();
 	CurTime = UtcToGpsTime(UtcTime);
 	GlonassTime = UtcToGlonassTime(UtcTime);
 	BdsTime = UtcToBdsTime(UtcTime);
 	CurPos = LlaToEcef(StartPos);
 	SpeedLocalToEcef(StartPos, StartVel, CurPos);
 
-	printf("[INFO]\tOpening output file: %s\n", OutputParam.filename);
-	if ((IfFile = fopen(OutputParam.filename, "wb")) == NULL)
+	if (!Arguments.ValidateOnly)
 	{
-		printf("[ERROR]\tFailed to open output file: %s\n", OutputParam.filename);
-		return 0;
+		printf("[INFO]\tOpening output file: %s\n", OutputParam.filename);
+		if ((IfFile = fopen(OutputParam.filename, "wb")) == NULL)
+		{
+			printf("[ERROR]\tFailed to open output file: %s\n", OutputParam.filename);
+			return 0;
+		}
+		printf("[INFO]\tOutput file opened successfully.\n");
 	}
-	printf("[INFO]\tOutput file opened successfully.\n");
 
 	if (Arguments.OutputTag)
 	{
@@ -343,6 +375,7 @@ int main(int argc, char* argv[])
 		NavBitArray[DataBitGNav]->SetEphemeris(i, (PGPS_EPHEMERIS)GloEph[i - 1]);
 	}
 	NavData.CompleteAlmanac(BdsSystem, UtcTime);
+	NavData.CompleteAlmanac(GalileoSystem, UtcTime);
 	NavBitArray[DataBitLNav]->SetAlmanac(NavData.GetGpsAlmanac());
 	NavBitArray[DataBitCNav]->SetAlmanac(NavData.GetGpsAlmanac());
 	NavBitArray[DataBitCNav2]->SetAlmanac(NavData.GetGpsAlmanac());
@@ -359,6 +392,17 @@ int main(int argc, char* argv[])
 	BdsSatNumber = (OutputParam.FreqSelect[BdsSystem]) ? GetVisibleSatellite(CurPos, CurTime, OutputParam, BdsSystem, BdsEph, TOTAL_BDS_SAT, BdsEphVisible) : 0;
 	GalSatNumber = (OutputParam.FreqSelect[GalileoSystem]) ? GetVisibleSatellite(CurPos, CurTime, OutputParam, GalileoSystem, GalEph, TOTAL_GAL_SAT, GalEphVisible) : 0;
 	GloSatNumber = (OutputParam.FreqSelect[GlonassSystem]) ? GetGlonassVisibleSatellite(CurPos, GlonassTime, OutputParam, GloEph, TOTAL_GLO_SAT, GloEphVisible) : 0;
+
+	CIonoKlobuchar8 IonoModel(NavData.GetGpsIono());
+	for (i = 0; i < TOTAL_GPS_SAT; i ++)
+		GpsSatParam[i].Initialize(GpsSystem, GpsEph[i], &IonoModel, PowerControl.InitCN0, PowerControl.Adjust);
+	for (i = 0; i < TOTAL_BDS_SAT; i ++)
+		BdsSatParam[i].Initialize(BdsSystem, BdsEph[i], &IonoModel, PowerControl.InitCN0, PowerControl.Adjust);
+	for (i = 0; i < TOTAL_GAL_SAT; i ++)
+		GalSatParam[i].Initialize(GalileoSystem, GalEph[i], &IonoModel, PowerControl.InitCN0, PowerControl.Adjust);
+	for (i = 0; i < TOTAL_GLO_SAT; i ++)
+		GloSatParam[i].Initialize(GlonassSystem, (PGPS_EPHEMERIS)GloEph[i], &IonoModel, PowerControl.InitCN0, PowerControl.Adjust);
+
 	ListCount = PowerControl.GetPowerControlList(0, PowerList);
 	UpdateSatParamList(CurTime, CurPos, ListCount, PowerList, NavData.GetGpsIono());
 
@@ -439,6 +483,7 @@ int main(int argc, char* argv[])
 	int TotalChannels = GpsSatNumber * GpsSignalCount + BdsSatNumber * BdsSignalCount + GalSatNumber * GalSignalCount + GloSatNumber * GloSignalCount;
 	printf("Total Visible SVs = %d, Total channels = %d\n\n", TotalVisibleSVs, TotalChannels);
 
+	// Detailed satellite and signal information in compact table format
 	for (SignalIndex = SIGNAL_INDEX_L1CA; SignalIndex <= SIGNAL_INDEX_L5; SignalIndex++)
 	{
 		if (!(OutputParam.FreqSelect[GpsSystem] & (1 << SignalIndex)))
@@ -453,9 +498,11 @@ int main(int argc, char* argv[])
 		{
 			if (TotalChannelNumber >= TOTAL_SAT_CHANNEL)
 				break;
-			SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq, GpsSystem, SignalIndex, GpsEphVisible[i]->svid);
-			SatIfSignal[TotalChannelNumber]->InitState(CurTime, &GpsSatParam[GpsEphVisible[i]->svid-1], GetNavData(GpsSystem, SignalIndex, NavBitArray));
-	        threads.emplace_back(IF_generate_thread, SatIfSignal[TotalChannelNumber]);
+			if (!Arguments.ValidateOnly)
+			{
+				SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq, GpsSystem, SignalIndex, GpsEphVisible[i]->svid);
+				SatIfSignal[TotalChannelNumber]->InitState(CurTime, &GpsSatParam[GpsEphVisible[i]->svid-1], GetNavData(GpsSystem, SignalIndex, NavBitArray));
+			}
 			TotalChannelNumber++;
 			
 			if (svCount % 4 == 0) printf("|");
@@ -471,6 +518,7 @@ int main(int argc, char* argv[])
 		if (svCount > 0 && (svCount-1) % 4 == 3) printf("\n");
 		printf("+----+--------------+----+--------------+----+--------------+----+--------------+\n\n");
 	}
+	
 	for (SignalIndex = SIGNAL_INDEX_B1C; SignalIndex <= SIGNAL_INDEX_B2b; SignalIndex++)
 	{
 		if (!(OutputParam.FreqSelect[BdsSystem] & (1 << SignalIndex)))
@@ -486,9 +534,11 @@ int main(int argc, char* argv[])
 		{
 			if (TotalChannelNumber >= TOTAL_SAT_CHANNEL)
 				break;
-			SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq, BdsSystem, SignalIndex, BdsEphVisible[i]->svid);
-			SatIfSignal[TotalChannelNumber]->InitState(CurTime, &BdsSatParam[BdsEphVisible[i]->svid - 1], GetNavData(BdsSystem, SignalIndex, NavBitArray));
-	        threads.emplace_back(IF_generate_thread, SatIfSignal[TotalChannelNumber]);
+			if (!Arguments.ValidateOnly)
+			{
+				SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq, BdsSystem, SignalIndex, BdsEphVisible[i]->svid);
+				SatIfSignal[TotalChannelNumber]->InitState(CurTime, &BdsSatParam[BdsEphVisible[i]->svid - 1], GetNavData(BdsSystem, SignalIndex, NavBitArray));
+			}
 			TotalChannelNumber++;
 			
 			if (svCount % 4 == 0) printf("|");
@@ -503,6 +553,7 @@ int main(int argc, char* argv[])
 		if (svCount > 0 && (svCount-1) % 4 == 3) printf("\n");
 		printf("+----+--------------+----+--------------+----+--------------+----+--------------+\n\n");
 	}
+	
 	for (SignalIndex = SIGNAL_INDEX_E1; SignalIndex <= SIGNAL_INDEX_E6; SignalIndex++)
 	{
 		if (!(OutputParam.FreqSelect[GalileoSystem] & (1 << SignalIndex)))
@@ -518,9 +569,11 @@ int main(int argc, char* argv[])
 		{
 			if (TotalChannelNumber >= TOTAL_SAT_CHANNEL)
 				break;
-			SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq, GalileoSystem, SignalIndex, GalEphVisible[i]->svid);
-			SatIfSignal[TotalChannelNumber]->InitState(CurTime, &GalSatParam[GalEphVisible[i]->svid - 1], GetNavData(GalileoSystem, SignalIndex, NavBitArray));
-	        threads.emplace_back(IF_generate_thread, SatIfSignal[TotalChannelNumber]);
+			if (!Arguments.ValidateOnly)
+			{
+				SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq, GalileoSystem, SignalIndex, GalEphVisible[i]->svid);
+				SatIfSignal[TotalChannelNumber]->InitState(CurTime, &GalSatParam[GalEphVisible[i]->svid - 1], GetNavData(GalileoSystem, SignalIndex, NavBitArray));
+			}
 			TotalChannelNumber++;
 			
 			if (svCount % 4 == 0) printf("|");
@@ -535,6 +588,7 @@ int main(int argc, char* argv[])
 		if (svCount > 0 && (svCount-1) % 4 == 3) printf("\n");
 		printf("+----+--------------+----+--------------+----+--------------+----+--------------+\n\n");
 	}
+	
 	for (SignalIndex = SIGNAL_INDEX_G1; SignalIndex <= SIGNAL_INDEX_G2; SignalIndex++)
 	{
 		if (!(OutputParam.FreqSelect[GlonassSystem] & (1 << SignalIndex)))
@@ -551,9 +605,11 @@ int main(int argc, char* argv[])
 			if (TotalChannelNumber >= TOTAL_SAT_CHANNEL)
 				break;
 			FdmaOffset = (SignalIndex == SIGNAL_INDEX_G1) ? GloEphVisible[i]->freq * 562500 : (SignalIndex == SIGNAL_INDEX_G2) ? GloEphVisible[i]->freq * 437500 : 0;
-			SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq + FdmaOffset, GlonassSystem, SignalIndex, GloEphVisible[i]->n);
-			SatIfSignal[TotalChannelNumber]->InitState(CurTime, &GloSatParam[GloEphVisible[i]->n - 1], GetNavData(GlonassSystem, SignalIndex, NavBitArray));
-	        threads.emplace_back(IF_generate_thread, SatIfSignal[TotalChannelNumber]);
+			if (!Arguments.ValidateOnly)
+			{
+				SatIfSignal[TotalChannelNumber] = new CSatIfSignal(OutputParam.SampleFreq, IfFreq + FdmaOffset, GlonassSystem, SignalIndex, GloEphVisible[i]->n);
+				SatIfSignal[TotalChannelNumber]->InitState(CurTime, &GloSatParam[GloEphVisible[i]->n - 1], GetNavData(GlonassSystem, SignalIndex, NavBitArray));
+			}
 			TotalChannelNumber++;
 			
 			if (svCount % 4 == 0) printf("|");
@@ -590,45 +646,76 @@ int main(int argc, char* argv[])
 	printf("[INFO]\tSignal Sample rate: %0.4f MHz\n\n", OutputParam.SampleFreq/1000.0);
 	fflush(stdout);
 
+	if (Arguments.ValidateOnly)
+		return 0;
+
+	if (Arguments.MultiThread)
+	{
+		total_threads = ThreadNumber;
+		for (int i = 0; i < ThreadNumber; i ++)
+			threads.emplace_back(IF_generate_thread, i);
+	}
+
 	auto start_time = std::chrono::high_resolution_clock::now();
 
 	while (!StepToNextMs())
 	{
-		// wait for all tasks ready
+		if (Arguments.MultiThread)
 		{
-			std::unique_lock<std::mutex> lock(mtx);
-			while (ready_tasks < TotalChannelNumber)
-				cv_ready.wait(lock);
-//			std::cout << "all threads ready" << std::endl;
-			exec_cycle ++;
-		// reset ready count
-			ready_tasks = 0;
-        }
+			// wait for all threads ready
+			{
+				std::unique_lock<std::mutex> lock(mtx);
+				cv_ready.wait(lock, [&] { return ready_tasks == total_threads; });
 
-		// wake all threads
-        cv_task.notify_all();
+				// add tasks to the queue for this cycle
+				for (i = 0; i < TOTAL_SAT_CHANNEL; i++)
+				{
+					if (!SatIfSignal[i])
+						continue;
+					task_queue.push(SatIfSignal[i]);
+				}
+
+				// reset counts and notify workers to start processing
+				ready_tasks = 0;
+				idle_threads = 0; // reset idle count
+				ready_generation++;
+				cv_task.notify_all(); 
+			}
+		}
 
 		// generate white noise
 		for (i = 0; i < OutputParam.SampleFreq; i ++)
 			NoiseArray[i] = GenerateNoise(1.0);
 
-        // wait all threads complete
+		if (!Arguments.MultiThread)	// for single thread, just call GetIfSample() for each channel
 		{
-			std::unique_lock<std::mutex> lock(mtx);
-			while (completed_tasks < TotalChannelNumber)
-				cv_done.wait(lock);
-//            std::cout << "all threads done for " << exec_cycle << std::endl;
-            completed_tasks = 0;
-        }
+			for (i = 0; i < TOTAL_SAT_CHANNEL; i++)
+			{
+				if (!SatIfSignal[i])
+					continue;
+				SatIfSignal[i]->GetIfSample(CurTime);
+			}
+		}
+		else
+		{
+			// wait all tasks in queue completed and all threads idle
+			{
+				std::unique_lock<std::mutex> lock(mtx);
+				cv_ready.wait(lock, [&] { return idle_threads == total_threads; });
+
+				work_generation++;
+				cv_task.notify_all();
+			}
+		}
 
 		for (i = 0; i < TOTAL_SAT_CHANNEL; i++)
 		{
 			if (!SatIfSignal[i])
 				continue;
-//			SatIfSignal[i]->GetIfSample(CurTime);
 			for (j = 0; j < OutputParam.SampleFreq; j++)
 				NoiseArray[j] += SatIfSignal[i]->SampleArray[j];
 		}
+		exec_cycle ++;
 
 		if (OutputParam.Format == OutputFormatIQ2) 
 		{
@@ -636,20 +723,20 @@ int main(int argc, char* argv[])
 			// Pack 2 samples per byte
 			fwrite(QuantArray, sizeof(unsigned char), OutputParam.SampleFreq / 2, IfFile);	// 1/2 byte/sample
 		}
-		else if (OutputParam.Format == OutputFormatIQ4)
+		else if (OutputParam.Format == OutputFormatIQ4) 
 		{
 			TotalClippedSamples += QuantSamplesIQ4(NoiseArray, OutputParam.SampleFreq, QuantArray, AGCGain);
-			fwrite(QuantArray, sizeof(unsigned char), OutputParam.SampleFreq, IfFile);
+			fwrite(QuantArray, sizeof(unsigned char), OutputParam.SampleFreq, IfFile); // 1 byte/sample
 		}
-		else if (OutputParam.Format == OutputFormatIQ16)
+		else if (OutputParam.Format == OutputFormatIQ16) 
 		{
 			TotalClippedSamples += QuantSamplesIQ16(NoiseArray, OutputParam.SampleFreq, QuantArray, AGCGain);
-			fwrite(QuantArray, sizeof(unsigned char) * 4, OutputParam.SampleFreq, IfFile);
+			fwrite(QuantArray, sizeof(unsigned char) * 4, OutputParam.SampleFreq, IfFile); // 4 bytes/sample
 		}
 		else
 		{
 			TotalClippedSamples += QuantSamplesIQ8(NoiseArray, OutputParam.SampleFreq, QuantArray, AGCGain);
-			fwrite(QuantArray, sizeof(unsigned char) * 2, OutputParam.SampleFreq, IfFile);
+			fwrite(QuantArray, sizeof(unsigned char) * 2, OutputParam.SampleFreq, IfFile); // 2 bytes/sample
 		}
 		TotalSamples += OutputParam.SampleFreq * 2; // I and Q
 
@@ -745,7 +832,7 @@ int main(int argc, char* argv[])
 	}
 	cv_task.notify_all();
 
-    // wait all threads complete
+	// wait all threads complete
 	for (auto& t : threads)
 	{
 		if (t.joinable()) t.join();
@@ -861,12 +948,12 @@ complex_number GenerateNoise(double Sigma)
 	double fvalue1, fvalue2, mag;
 
 	// Marsaglia Polar method (improved Box-Muller method)
-    do
+	do
 	{
-        fvalue1 = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
-        fvalue2 = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
-        mag = fvalue1 * fvalue1 + fvalue2 * fvalue2;
-    } while (mag >= 1.0 || mag == 0.0);
+		fvalue1 = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
+		fvalue2 = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
+		mag = fvalue1 * fvalue1 + fvalue2 * fvalue2;
+	} while (mag >= 1.0 || mag == 0.0);
 	mag = sqrt(-2.0 * log(mag) / mag) * Sigma;
 
 	return complex_number(fvalue1 * mag, fvalue2 * mag);
@@ -933,10 +1020,10 @@ NavBit* GetNavData(GnssSystem SatSystem, int SatSignalIndex, NavBit* NavBitArray
 	double Value;
 	unsigned char QuantByte;
 
-     // Process 2 complex samples at a time to produce 1 byte of output.
-     // Bit definition within each byte is (from MSB): Sign-Q2, Mag-Q2, Sign-I2, Mag-I2, Sign-Q1, Mag-Q1, Sign-I1, Mag-I1
-    for (int i = 0; i < Length; i += 2)
-    {
+	 // Process 2 complex samples at a time to produce 1 byte of output.
+	 // Bit definition within each byte is (from MSB): Sign-Q2, Mag-Q2, Sign-I2, Mag-I2, Sign-Q1, Mag-Q1, Sign-I1, Mag-I1
+	for (int i = 0; i < Length; i += 2)
+	{
 		QuantByte = (Samples[i].real < 0.0) ? 2 : 0;
 		Value = fabs(Samples[i].real);
 		QuantByte |= (Value < threshold) ? 0 : 1;
@@ -1033,31 +1120,16 @@ int QuantSamplesIQ8(complex_number Samples[], int Length, unsigned char QuantSam
 
 int QuantSamplesIQ16(complex_number Samples[], int Length, unsigned char QuantSamples[], double GainScale)
 {
-    int i;
-    int QuantValue;
-    
-    const double Gain = GainScale * 3277;
-    int ClippedCount = 0;
+	int i;
+	int QuantValue;
+	
+	const double Gain = GainScale * 3277;
+	int ClippedCount = 0;
 
-    for (i = 0; i < Length; i++)
-    {
-        QuantValue = (int)(Samples[i].real * Gain);  
-        if (QuantValue > 32767)  
-        {
-            QuantValue = 32767;
-            ClippedCount++;
-        }
-        else if (QuantValue < -32768)
-        {
-            QuantValue = -32768;
-            ClippedCount++;
-        }
-
-		QuantSamples[i * 4] = (unsigned char)(QuantValue & 0xff);    
-		QuantSamples[i * 4 + 1] = (unsigned char)((QuantValue >> 8) & 0xff);
-
-		QuantValue = (int)(Samples[i].imag * Gain); 
-		if (QuantValue > 32767) 
+	for (i = 0; i < Length; i++)
+	{
+		QuantValue = (int)(Samples[i].real * Gain);  
+		if (QuantValue > 32767)  
 		{
 			QuantValue = 32767;
 			ClippedCount++;
@@ -1067,12 +1139,28 @@ int QuantSamplesIQ16(complex_number Samples[], int Length, unsigned char QuantSa
 			QuantValue = -32768;
 			ClippedCount++;
 		}
+	
+		QuantSamples[i * 4] = (unsigned char)(QuantValue & 0xff);       
+		QuantSamples[i * 4 + 1] = (unsigned char)((QuantValue >> 8) & 0xff);  
 
-		QuantSamples[i * 4 + 2] = (unsigned char)(QuantValue & 0xff);  
-		QuantSamples[i * 4 + 3] = (unsigned char)((QuantValue >> 8) & 0xff); 
-    }
+	  
+		QuantValue = (int)(Samples[i].imag * Gain);  
+		if (QuantValue > 32767)  
+		{
+			QuantValue = 32767;
+			ClippedCount++;
+		}
+		else if (QuantValue < -32768)
+		{
+			QuantValue = -32768;
+			ClippedCount++;
+		}
+	  
+		QuantSamples[i * 4 + 2] = (unsigned char)(QuantValue & 0xff);        
+		QuantSamples[i * 4 + 3] = (unsigned char)((QuantValue >> 8) & 0xff);  
+	}
 
-    return ClippedCount;
+	return ClippedCount;
 }
 
 void ShowHelp(const char* ProgramPath)
@@ -1080,8 +1168,8 @@ void ShowHelp(const char* ProgramPath)
 	// Extract just the executable name from the path
 	std::string PathName = ProgramPath;
 	std::string ProgramName;
-    size_t pos = PathName.find_last_of("/\\");
-    if (pos == std::string::npos)
+	size_t pos = PathName.find_last_of("/\\");
+	if (pos == std::string::npos)
 		ProgramName = PathName;
 	else
 		ProgramName = PathName.substr(pos + 1);
@@ -1145,12 +1233,14 @@ bool ParseCommandLineArgs(int argc, char* argv[], CommandArguments &Arguments)
 			}
 			Arguments.OutputFile = argv[++i];
 			break;
-		case 3:	// --validateo-nly
+		case 3:	// --validate-only
 			Arguments.ValidateOnly = true;
 			break;
 		case 4:	// --multi-thread
+			Arguments.MultiThread = true;
+			break;
 		case 5:	// --single-thread
-			std::cerr << "[WARNING] " << arg << " ignored in multi-thread version\n";
+			Arguments.MultiThread = false;
 			break;
 		case 6:	// --tag
 			Arguments.OutputTag = true;
@@ -1166,56 +1256,56 @@ bool ParseCommandLineArgs(int argc, char* argv[], CommandArguments &Arguments)
 
 void CreateTagFile(const std::string& tagFilePath, const OUTPUT_PARAM& outputParam)
 {
-    printf("[INFO]\tCreating tag file: %s\n", tagFilePath.c_str());
-    FILE* tagFile = fopen(tagFilePath.c_str(), "w");
-    
-    if (!tagFile) {
-        std::cerr << "[WARNING]\tCould not create tag file: " << tagFilePath << std::endl;
-        return;
-    }
+	printf("[INFO]\tCreating tag file: %s\n", tagFilePath.c_str());
+	FILE* tagFile = fopen(tagFilePath.c_str(), "w");
+	
+	if (!tagFile) {
+		std::cerr << "[WARNING]\tCould not create tag file: " << tagFilePath << std::endl;
+		return;
+	}
 
-    // Get current time in UTC (PocketSDR uses UTC time)
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-    
-    struct tm* timeinfo = gmtime(&time_t);  // Use gmtime() instead of localtime()
-    
-    // Determine format strings
-    const char* formatStr;
-    const char* iqStr;
-    const char* bitsStr;
+	// Get current time in UTC (PocketSDR uses UTC time)
+	auto now = std::chrono::system_clock::now();
+	auto time_t = std::chrono::system_clock::to_time_t(now);
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+	
+	struct tm* timeinfo = gmtime(&time_t);  // Use gmtime() instead of localtime()
+	
+	// Determine format strings
+	const char* formatStr;
+	const char* iqStr;
+	const char* bitsStr;
 
-    if (outputParam.Format == OutputFormatIQ2) {
-        formatStr = "INT2X2";
-        iqStr = "1";
-        bitsStr = "2";
-    } else if (outputParam.Format == OutputFormatIQ4) {
-        formatStr = "INT4X2";
-        iqStr = "1";
-        bitsStr = "4";
-    }else if (outputParam.Format == OutputFormatIQ16){
+	if (outputParam.Format == OutputFormatIQ2) {
+		formatStr = "INT2X2";
+		iqStr = "1";
+		bitsStr = "2";
+	} else if (outputParam.Format == OutputFormatIQ4) {
+		formatStr = "INT4X2";
+		iqStr = "1";
+		bitsStr = "4";
+	}else if (outputParam.Format == OutputFormatIQ16){
 	formatStr = "INT16X2";
-        iqStr = "1";
-        bitsStr = "16"; 
-    }else { // OutputFormatIQ8
-        formatStr = "INT8X2";
-        iqStr = "1";
-        bitsStr = "8";
-    }
+		iqStr = "1";
+		bitsStr = "16"; 
+	}else { // OutputFormatIQ8
+		formatStr = "INT8X2";
+		iqStr = "1";
+		bitsStr = "8";
+	}
 
-    // Write tag file contents matching PocketSDR format exactly
-    fprintf(tagFile, "PROG = IFDataGen\n");
-    fprintf(tagFile, "TIME = %04d/%02d/%02d %02d:%02d:%02d.%03d\n",
-        timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-        timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, (int)ms.count());
-    fprintf(tagFile, "FMT  = %s\n", formatStr);
-    fprintf(tagFile, "F_S  = %.6f\n", outputParam.SampleFreq/1e3);		// Sample frequency in MHz
-    fprintf(tagFile, "F_LO = %.6f\n", outputParam.CenterFreq/1e3);		// Center frequency in MHz
-    fprintf(tagFile, "IQ   = %s\n", iqStr);
-    fprintf(tagFile, "BITS = %s\n", bitsStr);
-    fprintf(tagFile, "SCALE = 1.0\n");
+	// Write tag file contents matching PocketSDR format exactly
+	fprintf(tagFile, "PROG = IFDataGen\n");
+	fprintf(tagFile, "TIME = %04d/%02d/%02d %02d:%02d:%02d.%03d\n",
+		timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+		timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, (int)ms.count());
+	fprintf(tagFile, "FMT  = %s\n", formatStr);
+	fprintf(tagFile, "F_S  = %.6f\n", outputParam.SampleFreq/1e3);		// Sample frequency in MHz
+	fprintf(tagFile, "F_LO = %.6f\n", outputParam.CenterFreq/1e3);		// Center frequency in MHz
+	fprintf(tagFile, "IQ   = %s\n", iqStr);
+	fprintf(tagFile, "BITS = %s\n", bitsStr);
+	fprintf(tagFile, "SCALE = 1.0\n");
 
-    fclose(tagFile);
-    printf("[INFO]\tTag file created: %s\n", tagFilePath.c_str());
+	fclose(tagFile);
+	printf("[INFO]\tTag file created: %s\n", tagFilePath.c_str());
 }

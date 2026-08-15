@@ -34,6 +34,7 @@ public:
 	PSIGNAL_POWER PowerControlArray;
 	int TimeElapsMs;
 
+	void Clear();
 	void AddControlElement(PSIGNAL_POWER pControlElement);
 	void Sort();
 	void ResetTime();

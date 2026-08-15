@@ -368,6 +368,7 @@ int JsonStream::ReadFile(FILE *fpFile)
 	if (fpFile == NULL)
 		return -1;
 	p = stream;
+	DeleteAllTree();
 	RootObject = ParseObject(NULL, 0, &JsonStream::GetFileStream, (void *)fpFile);
 	stream[0] = '\0';
 	return 0;

@@ -691,6 +691,18 @@ double CTrajectory::GetTimeLength()
 	return totalTime;
 }
 
+int CTrajectory::GetSegmentCount()
+{
+	int count = 0;
+	CTrajectorySegment* pSegment = m_pTrajectoryList;
+	while (pSegment)
+	{
+		count++;
+		pSegment = pSegment->m_pNextTrajectory;
+	}
+	return count;
+}
+
 CTrajectorySegment *CTrajectory::GetTrajectorySegment(int Index)
 {
 	int CurIndex;

@@ -71,6 +71,14 @@ Beidu netdisk: https://pan.baidu.com/s/13rGBkdftv3G0gjSjxDPhbA?pwd=na5y
 
 ### 2026
 
+- **8/15/2026**
+  - Following modifications for safer and easier function call
+    1. Add API for navigation bit stream operation
+    2. Protection to support content reload
+    3. Add new class CScenarioData to encapsulate common operations on processing scenario contents
+  - Modify JsonObsGen using CScenarioData interface
+  - Update threads cooperation method in IfDataGenThread.cpp to use fixed number of threads on variable number of satellite signal generation
+
 - **7/15/2026**
   - JSON tree compose functions support all data fields
   - GPS time to UTC extends to start from year 1980 and add conversion to/from seconds since 1970.1.1
